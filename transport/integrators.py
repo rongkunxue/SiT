@@ -1,7 +1,7 @@
 import numpy as np
 import torch as th
 import torch.nn as nn
-from torchdiffeq import odeint
+from torchdiffeq import odeint, odeint_adjoint
 from functools import partial
 from tqdm import tqdm
 
@@ -113,5 +113,27 @@ class ode:
             method=self.sampler_type,
             atol=atol,
             rtol=rtol
+        )
+        return samples
+    
+    def sample_adjoint(self, x, model, model_param, **model_kwargs):
+        
+        device = x[0].device if isinstance(x, tuple) else x.device
+        def _fn(t, x):
+            t = th.ones(x[0].size(0)).to(device) * t if isinstance(x, tuple) else th.ones(x.size(0)).to(device) * t
+            model_output = self.drift(x, t, model, **model_kwargs)
+            return model_output
+
+        t = self.t.to(device)
+        atol = [self.atol] * len(x) if isinstance(x, tuple) else [self.atol]
+        rtol = [self.rtol] * len(x) if isinstance(x, tuple) else [self.rtol]
+        samples = odeint_adjoint(
+            _fn,
+            x,
+            t,
+            method=self.sampler_type,
+            atol=self.atol,
+            rtol=self.rtol,
+            adjoint_params=model_param,
         )
         return samples
