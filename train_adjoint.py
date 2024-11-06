@@ -8,7 +8,6 @@ from diffusers.models import AutoencoderKL
 from download import find_model
 from models import SiT_XL_2
 from PIL import Image
-from IPython.display import display
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cpu":
@@ -19,6 +18,50 @@ import json
 import torch.utils.data as data
 import numpy as np
 import sys
+
+@torch.no_grad()
+class AverageMeter(object):
+    """Computes and stores the average and current value"""
+
+    def __init__(self, name, fmt=":f"):
+        self.name = name
+        self.fmt = fmt
+        self.reset()
+
+    def reset(self):
+        self.val = 0
+        self.avg = 0
+        self.sum = 0
+        self.count = 0
+
+    def update(self, val, n=1):
+        self.val = val
+        self.sum += val * n
+        self.count += n
+        self.avg = self.sum / self.count
+
+    def __str__(self):
+        fmtstr = "{name} {val" + self.fmt + "} ({avg" + self.fmt + "})"
+        return fmtstr.format(**self.__dict__)
+
+@torch.no_grad()
+def accuracy(output, target, topk=(1,)):
+    """Computes the accuracy over the k top predictions for the specified values of k"""
+    with torch.no_grad():
+        maxk = max(topk)
+        batch_size = target.size(0)
+
+        _, pred = output.topk(maxk, 1, True, True)
+        pred = pred.t()
+        correct = pred.eq(target.view(1, -1).expand_as(pred))
+
+        res = []
+        for k in topk:
+            correct_k = correct[:k].reshape(-1).float().sum(0, keepdim=True)
+            res.append(correct_k.mul_(100.0 / batch_size))
+        return res
+
+
 
 def find_parameters(module):
 
@@ -273,7 +316,7 @@ def main(args):
         os.makedirs(checkpoint_dir, exist_ok=True)
 
         logging.info(f"Experiment directory created at {experiment_dir}")
-        wandb.init(project="SiT", name=experiment_name, dir=experiment_dir) if args.wandb else None
+        wandb.init(project="SiT", name=experiment_name, config=vars(args)) 
 
 
     accelerator.wait_for_everyone()
@@ -292,9 +335,7 @@ def main(args):
     if args.ckpt is not None:
         ckpt_path = args.ckpt
         state_dict = find_model(ckpt_path)
-        model.load_state_dict(state_dict["model"])
-        opt.load_state_dict(state_dict["opt"])
-        args = state_dict["args"]
+        model.load_state_dict(state_dict)
 
     transport = create_transport(
         args.path_type,
@@ -318,20 +359,25 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     # dataset = ImageFolder(args.data_path, transform=transform)
-    dataset = TinyImageNet("/home/zjow/Github/willisma/SiT/tiny-imagenet-200", True, transform)
-    loader = DataLoader(
-        dataset,
+    train_dataset = TinyImageNet("/root/Github/exp/tiny-imagenet-200", True, transform)
+    eval_dataset = TinyImageNet("/root/Github/exp/tiny-imagenet-200", True, transform)
+    train_loader = DataLoader(
+        train_dataset,
         batch_size=args.global_batch_size,
         shuffle=True,
         num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True
     )
-    logging.info(f"Dataset contains {len(dataset):,} images ({args.data_path})")
+    eval_loader = DataLoader(
+        eval_dataset,
+        batch_size=args.global_batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+    )
+    
 
     model_param = find_parameters(model)
 
-    model, head, opt, loader = accelerator.prepare(model, head, opt, loader)
+    model, head, opt, train_loader,eval_loader = accelerator.prepare(model, head, opt, train_loader,eval_loader)
 
     model.train()  # important! This enables embedding dropout for classifier-free guidance
  
@@ -339,50 +385,70 @@ def main(args):
     
 
     logging.info(f"Training for {args.epochs} epochs...")
-    
+    from timm.loss import LabelSmoothingCrossEntropy
+    criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
 
+    num_sampling_steps = 32 #@param {type:"slider", min:0, max:1000, step:1}
+    ODE_sampling_method = "euler" #@param ["dopri5", "euler", "rk4"]
+    atol = 1e-6
+    rtol = 1e-3
+    ode_sampler = Sampler(transport)
+    sample_fn = ode_sampler.reverse_sample_ode(
+        sampling_method=ODE_sampling_method,
+        atol=atol,
+        rtol=rtol,
+        num_steps=num_sampling_steps,
+        with_grad=True,
+    )
     for epoch in range(args.epochs):
         logging.info(f"Beginning epoch {epoch}...")
-        for x, y in loader:
-            x = x.to(device)
-            y = y.to(device)
-
-            y_null = torch.tensor([1000] * x.shape[0], device=device)
+        if epoch % 5 == 0:
+            top1 = AverageMeter("Acc@1", ":6.2f")
+            top5 = AverageMeter("Acc@5", ":6.2f")
+            model.eval()
+            with torch.no_grad():
+                for x, y in eval_loader:
+                    y_null = torch.tensor([1000] * x.shape[0], device=x.device)
+                    sample_model_kwargs = dict(y=y_null)
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                    samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1]
+                    logit = head(samples)
+                    logit,y=accelerator.gather_for_metrics((logit,y))
+                    acc1, acc5 = accuracy(logit,y, topk=(1, 5))
+                    top1.update(acc1[0], logit.size(0))
+                    top5.update(acc5[0], logit.size(0))
+                    if accelerator.is_main_process:
+                        wandb.log(
+                            {
+                                f"eval/acc1": top1.avg,
+                                f"eval/acc5": top5.avg,
+                                f"eval/epoch": epoch,
+                            },
+                            commit=False,
+                        )
+                        
+        for x, y in train_loader:
+            y_null = torch.tensor([1000] * x.shape[0], device=x.device)
             sample_model_kwargs = dict(y=y_null)
             with torch.no_grad():
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-
-            ode_sampler = Sampler(transport)
-            # Setup classifier-free guidance:
-            # z = torch.cat([x, x], 0)
-            z = x
-            
-
-            num_sampling_steps = 20 #@param {type:"slider", min:0, max:1000, step:1}
-            ODE_sampling_method = "euler" #@param ["dopri5", "euler", "rk4"]
-            atol = 1e-6
-            rtol = 1e-3
-            sample_fn = ode_sampler.reverse_sample_ode(
-                sampling_method=ODE_sampling_method,
-                atol=atol,
-                rtol=rtol,
-                num_steps=num_sampling_steps,
-                with_grad=True,
-            )
-            samples = sample_fn(z, model.forward, model_param, **sample_model_kwargs)[-1] # shape: [batch_size, 4, 32, 32]
-            logit = head(samples) # shape: [batch_size, 1000]
-            loss = nn.CrossEntropyLoss()(logit, y)
-            
+            samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1] 
+            logit = head(samples) 
+            loss = criterion(logit, y)
             opt.zero_grad()
             accelerator.backward(loss)
             opt.step()
-
-
-    # do any sampling/FID calculation/etc. with ema (or model) in eval mode ...
-
-    logging.info("Done!")
-    cleanup()
-
+            if accelerator.is_main_process:
+                wandb.log(
+                    {
+                        f"train/loss": loss.item(),
+                        f"train/epoch": epoch,
+                    },
+                    commit=False,
+                )
+                 
+        
+                        
 
 if __name__ == "__main__":
     # Default args here will train SiT-XL/2 with the hyperparameters we used in our paper (except training iters).
@@ -392,17 +458,17 @@ if __name__ == "__main__":
     parser.add_argument("--model", type=str, choices=list(SiT_models.keys()), default="SiT-XL/2")
     parser.add_argument("--image-size", type=int, choices=[256, 512], default=256)
     parser.add_argument("--num-classes", type=int, default=1000)
-    parser.add_argument("--epochs", type=int, default=1400)
+    parser.add_argument("--epochs", type=int, default=200)
     parser.add_argument("--global-batch-size", type=int, default=2)
     parser.add_argument("--global-seed", type=int, default=0)
     parser.add_argument("--vae", type=str, choices=["ema", "mse"], default="ema")  # Choice doesn't affect training
-    parser.add_argument("--num-workers", type=int, default=4)
+    parser.add_argument("--num-workers", type=int, default=8)
     parser.add_argument("--log-every", type=int, default=100)
     parser.add_argument("--ckpt-every", type=int, default=50_000)
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--ckpt", type=str, default=None,
+    parser.add_argument("--ckpt", type=str, default="/root/Model/SiT-XL-2-256.pt",
                         help="Optional path to a custom SiT checkpoint")
 
     parse_transport_args(parser)
