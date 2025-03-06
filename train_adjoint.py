@@ -399,67 +399,74 @@ def main(args):
         sampling_method=ODE_sampling_method,
         atol=atol,
         rtol=rtol,
-        num_steps=num_sampling_steps,
+        num_steps=20,
+        with_grad=True,
+    )
+    sample_cifar_fn = ode_sampler.reverse_sample_ode(
+        sampling_method=ODE_sampling_method,
+        atol=atol,
+        rtol=rtol,
+        num_steps=10,
         with_grad=True,
     )
     for epoch in range(args.epochs):
         logging.info(f"Beginning epoch {epoch}...")
-        # if epoch % 5 == 0:
-        #     top1 = AverageMeter("Acc@1", ":6.2f")
-        #     top5 = AverageMeter("Acc@5", ":6.2f")
-        #     model.eval()
-        #     with torch.no_grad():
-        #         for x, y in eval_loader:
-        #             y_null = torch.tensor([1000] * x.shape[0], device=x.device)
-        #             sample_model_kwargs = dict(y=y_null)
-        #             x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-        #             samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1]
-        #             logit = head(samples)
-        #             logit,y=accelerator.gather_for_metrics((logit,y))
-        #             acc1, acc5 = accuracy(logit,y, topk=(1, 5))
-        #             top1.update(acc1[0], logit.size(0))
-        #             top5.update(acc5[0], logit.size(0))
-        #             if accelerator.is_main_process:
-        #                 wandb.log(
-        #                     {
-        #                         f"eval/tiny_acc1": top1.avg,
-        #                         f"eval/tiny_acc5": top5.avg,
-        #                         f"eval/tiny_epoch": epoch,
-        #                     },
-        #                     commit=False,
-        #                 )
+        if epoch % 5 == 0:
+            top1 = AverageMeter("Acc@1", ":6.2f")
+            top5 = AverageMeter("Acc@5", ":6.2f")
+            model.eval()
+            with torch.no_grad():
+                for x, y in eval_loader:
+                    y_null = torch.tensor([1000] * x.shape[0], device=x.device)
+                    sample_model_kwargs = dict(y=y_null)
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                    samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1]
+                    logit = head(samples)
+                    logit,y=accelerator.gather_for_metrics((logit,y))
+                    acc1, acc5 = accuracy(logit,y, topk=(1, 5))
+                    top1.update(acc1[0], logit.size(0))
+                    top5.update(acc5[0], logit.size(0))
+                    if accelerator.is_main_process:
+                        wandb.log(
+                            {
+                                f"eval/tiny_acc1": top1.avg,
+                                f"eval/tiny_acc5": top5.avg,
+                                f"eval/tiny_epoch": epoch,
+                            },
+                            commit=False,
+                        )
 
-        # if epoch % 5 == 0:
-        #     top1 = AverageMeter("Acc@1", ":6.2f")
-        #     top5 = AverageMeter("Acc@5", ":6.2f")
-        #     model.eval()
-        #     with torch.no_grad():
-        #         for x, y in eval_cifar_dataloader:
-        #             y_null = torch.tensor([1000] * x.shape[0], device=x.device)
-        #             sample_model_kwargs = dict(y=y_null)
-        #             x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-        #             samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1]
-        #             logit = head(samples)
-        #             logit,y=accelerator.gather_for_metrics((logit,y))
-        #             acc1, acc5 = accuracy(logit,y, topk=(1, 5))
-        #             top1.update(acc1[0], logit.size(0))
-        #             top5.update(acc5[0], logit.size(0))
-        #             if accelerator.is_main_process:
-        #                 wandb.log(
-        #                     {
-        #                         f"eval/cifar_acc1": top1.avg,
-        #                         f"eval/cifar_acc5": top5.avg,
-        #                         f"eval/cifar_epoch": epoch,
-        #                     },
-        #                     commit=False,
-        #                 )
+        if epoch % 5 == 0:
+            top1 = AverageMeter("Acc@1", ":6.2f")
+            top5 = AverageMeter("Acc@5", ":6.2f")
+            model.eval()
+            with torch.no_grad():
+                for x, y in eval_cifar_dataloader:
+                    y_null = torch.tensor([1000] * x.shape[0], device=x.device)
+                    sample_model_kwargs = dict(y=y_null)
+                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+                    samples = sample_cifar_fn(x, model.forward, model_param, **sample_model_kwargs)[-1]
+                    logit = head(samples)
+                    logit,y=accelerator.gather_for_metrics((logit,y))
+                    acc1, acc5 = accuracy(logit,y, topk=(1, 5))
+                    top1.update(acc1[0], logit.size(0))
+                    top5.update(acc5[0], logit.size(0))
+                    if accelerator.is_main_process:
+                        wandb.log(
+                            {
+                                f"eval/cifar_acc1": top1.avg,
+                                f"eval/cifar_acc5": top5.avg,
+                                f"eval/cifar_epoch": epoch,
+                            },
+                            commit=False,
+                        )
                         
         for x, y in train_cifar_dataloader:
             y_null = torch.tensor([1000] * x.shape[0], device=x.device)
             sample_model_kwargs = dict(y=y_null)
             with torch.no_grad():
                 x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-            samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1] 
+            samples = sample_cifar_fn(x, model.forward, model_param, **sample_model_kwargs)[-1] 
             logit = head(samples) 
             loss = criterion(logit, y)
             opt.zero_grad()
