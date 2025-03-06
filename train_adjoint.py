@@ -8,6 +8,8 @@ from diffusers.models import AutoencoderKL
 from download import find_model
 from models import SiT_XL_2
 from PIL import Image
+import torchvision
+import torchvision.transforms as transforms
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 if device == "cpu":
@@ -359,8 +361,11 @@ def main(args):
         transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5], inplace=True)
     ])
     # dataset = ImageFolder(args.data_path, transform=transform)
-    train_dataset = TinyImageNet("/root/Github/exp/tiny-imagenet-200", True, transform)
-    eval_dataset = TinyImageNet("/root/Github/exp/tiny-imagenet-200", True, transform)
+    train_dataset = TinyImageNet("/root/Github/data/tiny-imagenet-200", True, transform)
+    # use cifar10 for training
+    train_cifar_dataset = torchvision.datasets.CIFAR10(root='./data', train=True, download=True, transform=transform)
+    eval_cifar_dataset = torchvision.datasets.CIFAR10(root='./data', train=False, download=True, transform=transform)
+    eval_dataset = TinyImageNet("/root/Github/data/tiny-imagenet-200", True, transform)
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.global_batch_size,
@@ -371,19 +376,16 @@ def main(args):
         eval_dataset,
         batch_size=args.global_batch_size,
         shuffle=False,
-        num_workers=args.num_workers,
-    )
-    
+        num_workers=args.num_workers)
+    train_cifar_dataloader=DataLoader(train_cifar_dataset, batch_size=args.global_batch_size, shuffle=True, num_workers=args.num_workers)
+    eval_cifar_dataloader=DataLoader(eval_cifar_dataset, batch_size=args.global_batch_size, shuffle=False, num_workers=args.num_workers)    
 
     model_param = find_parameters(model)
 
-    model, head, opt, train_loader,eval_loader = accelerator.prepare(model, head, opt, train_loader,eval_loader)
+    model, head, opt, train_loader,eval_loader,train_cifar_dataloader,eval_cifar_dataloader = accelerator.prepare(model, head, opt, train_loader,eval_loader,train_cifar_dataloader,eval_cifar_dataloader)
 
-    model.train()  # important! This enables embedding dropout for classifier-free guidance
- 
-    # Create sampling noise:
+    model.train() 
     
-
     logging.info(f"Training for {args.epochs} epochs...")
     from timm.loss import LabelSmoothingCrossEntropy
     criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
@@ -402,31 +404,76 @@ def main(args):
     )
     for epoch in range(args.epochs):
         logging.info(f"Beginning epoch {epoch}...")
-        if epoch % 5 == 0:
-            top1 = AverageMeter("Acc@1", ":6.2f")
-            top5 = AverageMeter("Acc@5", ":6.2f")
-            model.eval()
-            with torch.no_grad():
-                for x, y in eval_loader:
-                    y_null = torch.tensor([1000] * x.shape[0], device=x.device)
-                    sample_model_kwargs = dict(y=y_null)
-                    x = vae.encode(x).latent_dist.sample().mul_(0.18215)
-                    samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1]
-                    logit = head(samples)
-                    logit,y=accelerator.gather_for_metrics((logit,y))
-                    acc1, acc5 = accuracy(logit,y, topk=(1, 5))
-                    top1.update(acc1[0], logit.size(0))
-                    top5.update(acc5[0], logit.size(0))
-                    if accelerator.is_main_process:
-                        wandb.log(
-                            {
-                                f"eval/acc1": top1.avg,
-                                f"eval/acc5": top5.avg,
-                                f"eval/epoch": epoch,
-                            },
-                            commit=False,
-                        )
+        # if epoch % 5 == 0:
+        #     top1 = AverageMeter("Acc@1", ":6.2f")
+        #     top5 = AverageMeter("Acc@5", ":6.2f")
+        #     model.eval()
+        #     with torch.no_grad():
+        #         for x, y in eval_loader:
+        #             y_null = torch.tensor([1000] * x.shape[0], device=x.device)
+        #             sample_model_kwargs = dict(y=y_null)
+        #             x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+        #             samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1]
+        #             logit = head(samples)
+        #             logit,y=accelerator.gather_for_metrics((logit,y))
+        #             acc1, acc5 = accuracy(logit,y, topk=(1, 5))
+        #             top1.update(acc1[0], logit.size(0))
+        #             top5.update(acc5[0], logit.size(0))
+        #             if accelerator.is_main_process:
+        #                 wandb.log(
+        #                     {
+        #                         f"eval/tiny_acc1": top1.avg,
+        #                         f"eval/tiny_acc5": top5.avg,
+        #                         f"eval/tiny_epoch": epoch,
+        #                     },
+        #                     commit=False,
+        #                 )
+
+        # if epoch % 5 == 0:
+        #     top1 = AverageMeter("Acc@1", ":6.2f")
+        #     top5 = AverageMeter("Acc@5", ":6.2f")
+        #     model.eval()
+        #     with torch.no_grad():
+        #         for x, y in eval_cifar_dataloader:
+        #             y_null = torch.tensor([1000] * x.shape[0], device=x.device)
+        #             sample_model_kwargs = dict(y=y_null)
+        #             x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+        #             samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1]
+        #             logit = head(samples)
+        #             logit,y=accelerator.gather_for_metrics((logit,y))
+        #             acc1, acc5 = accuracy(logit,y, topk=(1, 5))
+        #             top1.update(acc1[0], logit.size(0))
+        #             top5.update(acc5[0], logit.size(0))
+        #             if accelerator.is_main_process:
+        #                 wandb.log(
+        #                     {
+        #                         f"eval/cifar_acc1": top1.avg,
+        #                         f"eval/cifar_acc5": top5.avg,
+        #                         f"eval/cifar_epoch": epoch,
+        #                     },
+        #                     commit=False,
+        #                 )
                         
+        for x, y in train_cifar_dataloader:
+            y_null = torch.tensor([1000] * x.shape[0], device=x.device)
+            sample_model_kwargs = dict(y=y_null)
+            with torch.no_grad():
+                x = vae.encode(x).latent_dist.sample().mul_(0.18215)
+            samples = sample_fn(x, model.forward, model_param, **sample_model_kwargs)[-1] 
+            logit = head(samples) 
+            loss = criterion(logit, y)
+            opt.zero_grad()
+            accelerator.backward(loss)
+            opt.step()
+            if accelerator.is_main_process:
+                wandb.log(
+                    {
+                        f"train/cifar_loss": loss.item(),
+                        f"train/cifar_epoch": epoch,
+                    },
+                    commit=False,
+                )
+                 
         for x, y in train_loader:
             y_null = torch.tensor([1000] * x.shape[0], device=x.device)
             sample_model_kwargs = dict(y=y_null)
@@ -441,12 +488,13 @@ def main(args):
             if accelerator.is_main_process:
                 wandb.log(
                     {
-                        f"train/loss": loss.item(),
-                        f"train/epoch": epoch,
+                        f"train/tiny_loss": loss.item(),
+                        f"train/tiny_epoch": epoch,
                     },
                     commit=False,
                 )
-                 
+
+    
         
                         
 
@@ -468,7 +516,7 @@ if __name__ == "__main__":
     parser.add_argument("--sample-every", type=int, default=10_000)
     parser.add_argument("--cfg-scale", type=float, default=4.0)
     parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--ckpt", type=str, default="/root/Model/SiT-XL-2-256.pt",
+    parser.add_argument("--ckpt", type=str, default="SiT-XL-2-256x256.pt",
                         help="Optional path to a custom SiT checkpoint")
 
     parse_transport_args(parser)
